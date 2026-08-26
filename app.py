@@ -431,32 +431,60 @@ def bar_at(g, minute):
         return None
     return z.iloc[0]
 
-def build_history(all_df, trailing_dates, symbols):
+
+def build_history(all_df, trailing_dates, symbols, window_minutes=60, same_day_mode=False, subject_day=None):
+    """
+    Build ranking metrics.
+
+    trailing_dates:
+      - normal backtest: prior N completed sessions
+      - same_day_mode: ignored; subject_day is used instead (look-ahead diagnostic only)
+
+    window_minutes:
+      Best historical window length, 15–120 minutes.
+    """
     rows = []
+
+    if same_day_mode:
+        analysis_dates = [subject_day]
+    else:
+        analysis_dates = list(trailing_dates)
+
+    required_count = len(analysis_dates)
+    if required_count < 1:
+        return pd.DataFrame()
+
+    max_start = 120 - int(window_minutes)
+    if max_start < 0:
+        return pd.DataFrame()
+
     for sym in symbols:
         sym_daily = []
         complete = True
-        for d in trailing_dates:
+
+        for d in analysis_dates:
             g = all_df[(all_df["symbol"] == sym) & (all_df["date"] == d)]
             if not session_complete(g):
                 complete = False
                 break
             gain, ldv = session_metrics(g)
             sym_daily.append((d, gain, ldv, g))
-        if not complete or len(sym_daily) != 15:
+
+        if not complete or len(sym_daily) != required_count:
             continue
 
         avg_gain = float(np.mean([x[1] for x in sym_daily]))
         median_ldv = float(np.median([x[2] for x in sym_daily]))
 
-        # Determine the historically best average 1-hour START TIME
-        # on a 1-minute grid, using only the prior 15 sessions.
+        # Historical best average window START TIME.
         best_start = None
-        best_avg_1h = -np.inf
-        for start_min in range(0, 61):  # 8:30 through 9:30 CT
-            end_min = start_min + 60
+        best_avg_window = -np.inf
+
+        for start_min in range(0, max_start + 1):
+            end_min = start_min + int(window_minutes)
             returns = []
             valid = True
+
             for _, _, _, g in sym_daily:
                 b0 = bar_at(g, start_min)
                 b1 = bar_at(g, end_min)
@@ -465,22 +493,22 @@ def build_history(all_df, trailing_dates, symbols):
                     break
                 ret = (float(b1["close"]) / float(b0["open"]) - 1) * 100
                 returns.append(ret)
-            if valid and len(returns) == 15:
+
+            if valid and len(returns) == required_count:
                 av = float(np.mean(returns))
-                if av > best_avg_1h:
-                    best_avg_1h = av
+                if av > best_avg_window:
+                    best_avg_window = av
                     best_start = start_min
 
         if best_start is None:
             continue
 
-        # For the profit target, calculate EACH prior day's best 1-hour gain,
-        # then take the median of those 15 daily best-hour gains.
-        daily_best_1h_gains = []
+        # Daily best-window gains, then median across the analysis period.
+        daily_best_window_gains = []
         for _, _, _, g in sym_daily:
             day_best = -np.inf
-            for start_min in range(0, 61):
-                end_min = start_min + 60
+            for start_min in range(0, max_start + 1):
+                end_min = start_min + int(window_minutes)
                 b0 = bar_at(g, start_min)
                 b1 = bar_at(g, end_min)
                 if b0 is None or b1 is None:
@@ -488,34 +516,36 @@ def build_history(all_df, trailing_dates, symbols):
                 ret = (float(b1["close"]) / float(b0["open"]) - 1) * 100
                 if ret > day_best:
                     day_best = ret
-            if np.isfinite(day_best):
-                daily_best_1h_gains.append(float(day_best))
 
-        if len(daily_best_1h_gains) != 15:
+            if np.isfinite(day_best):
+                daily_best_window_gains.append(float(day_best))
+
+        if len(daily_best_window_gains) != required_count:
             continue
 
-        median_best_1h_gain = float(np.median(daily_best_1h_gains))
+        median_best_window_gain = float(np.median(daily_best_window_gains))
 
         rows.append({
             "symbol": sym,
             "avg_2h_gain_pct": avg_gain,
             "median_ldv_pct": median_ldv,
             "best_start_min": int(best_start),
-            "best_end_min": int(best_start + 60),
-            "best_avg_1h_gain_pct": float(best_avg_1h),
-            "median_daily_best_1h_gain_pct": median_best_1h_gain,
+            "best_end_min": int(best_start + int(window_minutes)),
+            "best_avg_window_gain_pct": float(best_avg_window),
+            "median_daily_best_window_gain_pct": median_best_window_gain,
+            "analysis_sessions": required_count,
+            "window_minutes": int(window_minutes),
         })
 
     rank = pd.DataFrame(rows)
     if rank.empty:
         return rank
 
-    # Top performers = highest average 8:30–10:30 return, matching project definition.
     rank = rank.sort_values(
-        ["avg_2h_gain_pct", "best_avg_1h_gain_pct", "median_ldv_pct"],
+        ["avg_2h_gain_pct", "best_avg_window_gain_pct", "median_ldv_pct"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
-    rank["rank"] = np.arange(1, len(rank)+1)
+    rank["rank"] = np.arange(1, len(rank) + 1)
     return rank
 
 def time_label(minute):
@@ -584,21 +614,32 @@ def simulate_one_trade(g, entry_min, end_min, gain_target_pct, stop_pct):
         "reason": "BEST-HOUR END"
     }
 
-def run_s1(subject_df, top10):
+
+def run_s1(subject_df, top10, profit_trigger_pct=90.0, loss_trigger_pct=80.0):
     trades = []
+
     for _, r in top10.iterrows():
         g = subject_df[subject_df["symbol"] == r["symbol"]]
+
+        gain_target = (float(profit_trigger_pct) / 100.0) * float(r["median_daily_best_window_gain_pct"])
+        stop_target = (float(loss_trigger_pct) / 100.0) * float(r["median_ldv_pct"])
+
         tr = simulate_one_trade(
             g,
             int(r["best_start_min"]),
             int(r["best_end_min"]),
-            0.90 * float(r["median_daily_best_1h_gain_pct"]),
-            0.80 * float(r["median_ldv_pct"]),
+            gain_target,
+            stop_target,
         )
+
         if tr:
             trades.append({
                 "symbol": r["symbol"],
                 "rank": int(r["rank"]),
+                "profit_trigger_setting_pct": float(profit_trigger_pct),
+                "loss_trigger_setting_pct": float(loss_trigger_pct),
+                "profit_target_pct": gain_target,
+                "stop_target_pct": stop_target,
                 **tr,
             })
 
@@ -606,17 +647,12 @@ def run_s1(subject_df, top10):
         return np.nan, pd.DataFrame()
 
     tdf = pd.DataFrame(trades)
-    # Equal capital in all Top 10.
     return float(tdf["return_pct"].mean()), tdf
 
-def run_s2(subject_df, top10):
+
+def run_s2(subject_df, top10, profit_trigger_pct=90.0, loss_trigger_pct=80.0):
     """
-    100% capital round-robin.
-    #1 begins no earlier than its historical best start.
-    After each exit, the next eligible name begins at the NEXT minute to avoid
-    impossible within-minute sequencing. A name is skipped if its best hour ended.
-    After #10, cycle back to #1 while any best-hour window remains open.
-    Daily return compounds each sequential trade.
+    Sequential round-robin using 100% of current capital per trade.
     """
     rows = top10.sort_values("rank").to_dict("records")
     if not rows:
@@ -628,8 +664,7 @@ def run_s2(subject_df, top10):
     trades = []
     no_trade_pass = 0
 
-    # Hard guard against pathological loops.
-    for _ in range(200):
+    for _ in range(300):
         r = rows[idx]
         start = int(r["best_start_min"])
         end = int(r["best_end_min"])
@@ -639,23 +674,34 @@ def run_s2(subject_df, top10):
 
         if entry_min <= end:
             g = subject_df[subject_df["symbol"] == r["symbol"]]
+
+            gain_target = (float(profit_trigger_pct) / 100.0) * float(r["median_daily_best_window_gain_pct"])
+            stop_target = (float(loss_trigger_pct) / 100.0) * float(r["median_ldv_pct"])
+
             tr = simulate_one_trade(
                 g,
                 entry_min,
                 end,
-                0.90 * float(r["median_daily_best_1h_gain_pct"]),
-                0.80 * float(r["median_ldv_pct"]),
+                gain_target,
+                stop_target,
             )
+
             if tr:
                 did_trade = True
-                equity *= (1 + tr["return_pct"]/100)
+                equity *= (1 + tr["return_pct"] / 100)
+
                 trades.append({
                     "cycle_position": idx + 1,
                     "symbol": r["symbol"],
                     "rank": int(r["rank"]),
+                    "profit_trigger_setting_pct": float(profit_trigger_pct),
+                    "loss_trigger_setting_pct": float(loss_trigger_pct),
+                    "profit_target_pct": gain_target,
+                    "stop_target_pct": stop_target,
                     **tr,
                     "equity_after": equity,
                 })
+
                 current_min = int(tr["exit_min"]) + 1
 
         idx = (idx + 1) % len(rows)
@@ -665,15 +711,12 @@ def run_s2(subject_df, top10):
         else:
             no_trade_pass += 1
 
-        # If we've checked all 10 without finding any eligible remaining window, stop.
         if no_trade_pass >= len(rows):
             break
-        # No strategy trading past 10:30 CT.
         if current_min > 120:
             break
 
     return (equity - 1) * 100, pd.DataFrame(trades)
-
 
 st.sidebar.header("Market Data")
 mode = st.sidebar.radio("Source", ["Real Alpaca data", "Built-in sample data"])
@@ -806,67 +849,153 @@ st.caption(
 )
 
 
+
 st.divider()
-st.header("Rolling 15-Day Strategy Backtest")
+st.header("Custom Strategy Backtest")
 st.caption(
-    "For each subject day, the model selects that day's Top 10 using only the previous "
-    "15 completed market sessions, then simulates S1 and S2 on the actual subject-day prices."
+    "Test different trigger levels, lookback periods, and historical best-window lengths "
+    "without changing the code."
 )
 
-with st.expander("Backtest definitions & assumptions", expanded=False):
+with st.expander("How the customizable settings work", expanded=False):
     st.markdown(
         """
-**S1 — Trigger Scenario**
-- Equal capital across all Top 10.
-- Enter each stock at its trailing-15 historical best-hour start.
-- Profit exit: **90% of trailing-15 median daily best 1-hour gain**.
-- Stop exit: **80% of trailing-15 median LDV**.
-- If neither triggers, exit at that stock's historical best-hour end.
+### Profit trigger
+The selected percentage is multiplied by the **median daily best-window gain**
+from the chosen historical lookback.
 
-**S2 — Round Robin**
-- Start with rank #1 and use one pool of capital sequentially.
-- Profit exit: **90% of trailing-15 median daily best 1-hour gain**.
-- Stop exit: **80% of trailing-15 median LDV**.
-- After an exit, move to the next ranked stock if its historical best hour is still open.
-- After #10, cycle back to #1 while eligible best-hour windows remain.
-- The next trade begins on the next 1-minute bar after the prior exit.
-- Returns compound sequentially.
+Example: median best-window gain = 2.00%, profit trigger = 90% → target = **+1.80%**.
 
-**Estimation rule**
-If both the target and stop are touched inside the same 1-minute candle, the backtest
-assumes the **stop occurred first**. This is deliberately conservative because 1-minute
-bars do not reveal the exact intrabar order.
+### Loss trigger
+The selected percentage is multiplied by the **median LDV**
+from the chosen historical lookback.
+
+Example: median LDV = 1.00%, loss trigger = 80% → stop = **-0.80%**.
+
+### Lookback
+Choose **0–30 sessions**.
+
+- **1–30** = clean rolling backtest using only prior completed market sessions.
+- **0** = same-day diagnostic mode. It uses the subject day's own data to choose rankings,
+  best window, and trigger statistics. That creates look-ahead bias, so it should **not**
+  be treated as a valid forward backtest.
+
+### Best-window length
+Choose any window from **15 to 120 minutes**.
+The system searches every possible 1-minute start time inside the 8:30–10:30 AM Central period.
 """
     )
 
-bc1, bc2 = st.columns(2)
-with bc1:
+st.subheader("Backtest parameters")
+
+p1, p2, p3 = st.columns(3)
+
+with p1:
+    lookback_sessions = st.slider(
+        "Historical lookback sessions",
+        min_value=0,
+        max_value=30,
+        value=15,
+        step=1,
+        help="0 = same-day diagnostic (look-ahead). 1–30 = prior completed sessions only."
+    )
+
+with p2:
+    best_window_minutes = st.slider(
+        "Best-window length (minutes)",
+        min_value=15,
+        max_value=120,
+        value=60,
+        step=5,
+        help="The historical best window can be any duration from 15 to 120 minutes."
+    )
+
+with p3:
+    st.metric(
+        "Possible window starts",
+        121 - best_window_minutes
+    )
+
+st.subheader("S1 — Trigger Scenario")
+s1c1, s1c2 = st.columns(2)
+
+with s1c1:
+    s1_profit_pct = st.slider(
+        "S1 profit trigger (% of median best-window gain)",
+        min_value=0,
+        max_value=200,
+        value=90,
+        step=5,
+    )
+
+with s1c2:
+    s1_loss_pct = st.slider(
+        "S1 loss trigger (% of median LDV)",
+        min_value=0,
+        max_value=200,
+        value=80,
+        step=5,
+    )
+
+st.subheader("S2 — Round Robin")
+s2c1, s2c2 = st.columns(2)
+
+with s2c1:
+    s2_profit_pct = st.slider(
+        "S2 profit trigger (% of median best-window gain)",
+        min_value=0,
+        max_value=200,
+        value=90,
+        step=5,
+    )
+
+with s2c2:
+    s2_loss_pct = st.slider(
+        "S2 loss trigger (% of median LDV)",
+        min_value=0,
+        max_value=200,
+        value=80,
+        step=5,
+    )
+
+st.subheader("Subject dates")
+dc1, dc2 = st.columns(2)
+
+with dc1:
     backtest_start = st.date_input(
         "First subject day",
         value=pd.Timestamp("2026-08-11").date(),
         key="backtest_subject_start",
     )
-with bc2:
+
+with dc2:
     backtest_end = st.date_input(
         "Last subject day",
         value=pd.Timestamp("2026-08-25").date(),
         key="backtest_subject_end",
     )
 
+if lookback_sessions == 0:
+    st.warning(
+        "Lookback = 0 uses same-day data to select the Top 10 and derive the historical window/targets. "
+        "This is useful for diagnostics, but it contains look-ahead bias and is not a valid forward backtest."
+    )
+
 st.caption(
-    f"The backtest will use the current sidebar universe ({len(symbols)} symbols) "
-    f"and the current **{feed.upper()}** market-data feed."
+    f"Current universe: {len(symbols)} symbols | Feed: {feed.upper()} | "
+    f"Window length: {best_window_minutes} min | Lookback: {lookback_sessions} sessions"
 )
 
-if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_backtest"):
+if st.button("Run custom backtest", type="primary", key="run_custom_backtest"):
     if not ALPACA_KEY or not ALPACA_SECRET:
         st.error("Alpaca credentials are missing from Streamlit Secrets.")
     elif backtest_end < backtest_start:
         st.error("The last subject day must be on or after the first subject day.")
     else:
-        # Pull enough calendar history to obtain at least 15 completed trading sessions.
-        calendar_start = pd.Timestamp(backtest_start) - pd.Timedelta(days=35)
+        extra_days = max(5, lookback_sessions * 2 + 10)
+        calendar_start = pd.Timestamp(backtest_start) - pd.Timedelta(days=extra_days)
         calendar_end = pd.Timestamp(backtest_end)
+
         candidate_dates = [d.date() for d in pd.bdate_range(calendar_start, calendar_end)]
 
         progress = st.progress(0)
@@ -880,8 +1009,10 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
             except Exception as e:
                 st.error(f"{d}: {e}")
                 st.stop()
+
             if not x.empty:
                 frames.append(x)
+
             progress.progress((i + 1) / len(candidate_dates))
 
         status.empty()
@@ -891,6 +1022,7 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
         else:
             all_bt_df = pd.concat(frames, ignore_index=True)
             available_dates = sorted(all_bt_df["date"].unique())
+
             subject_dates = [
                 d for d in available_dates
                 if backtest_start <= d <= backtest_end
@@ -902,12 +1034,39 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
             rankings = []
 
             for subject_day in subject_dates:
-                previous_dates = [x for x in available_dates if x < subject_day]
-                if len(previous_dates) < 15:
-                    continue
+                same_day_mode = lookback_sessions == 0
 
-                trailing_dates = previous_dates[-15:]
-                hist = build_history(all_bt_df, trailing_dates, symbols)
+                if same_day_mode:
+                    trailing_dates = []
+                    hist = build_history(
+                        all_bt_df,
+                        trailing_dates,
+                        symbols,
+                        window_minutes=best_window_minutes,
+                        same_day_mode=True,
+                        subject_day=subject_day,
+                    )
+                    trailing_start = subject_day
+                    trailing_end = subject_day
+                else:
+                    previous_dates = [x for x in available_dates if x < subject_day]
+                    if len(previous_dates) < lookback_sessions:
+                        continue
+
+                    trailing_dates = previous_dates[-lookback_sessions:]
+
+                    hist = build_history(
+                        all_bt_df,
+                        trailing_dates,
+                        symbols,
+                        window_minutes=best_window_minutes,
+                        same_day_mode=False,
+                        subject_day=None,
+                    )
+
+                    trailing_start = trailing_dates[0]
+                    trailing_end = trailing_dates[-1]
+
                 if hist.empty or len(hist) < 10:
                     continue
 
@@ -915,12 +1074,25 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
                 top10["subject_date"] = subject_day
                 top10["best_start_ct"] = top10["best_start_min"].map(time_label)
                 top10["best_end_ct"] = top10["best_end_min"].map(time_label)
+                top10["lookback_sessions"] = lookback_sessions
+                top10["window_minutes"] = best_window_minutes
                 rankings.append(top10)
 
                 subject_df = all_bt_df[all_bt_df["date"] == subject_day]
 
-                s1_ret, s1_trades = run_s1(subject_df, top10)
-                s2_ret, s2_trades = run_s2(subject_df, top10)
+                s1_ret, s1_trades = run_s1(
+                    subject_df,
+                    top10,
+                    profit_trigger_pct=s1_profit_pct,
+                    loss_trigger_pct=s1_loss_pct,
+                )
+
+                s2_ret, s2_trades = run_s2(
+                    subject_df,
+                    top10,
+                    profit_trigger_pct=s2_profit_pct,
+                    loss_trigger_pct=s2_loss_pct,
+                )
 
                 if not s1_trades.empty:
                     s1_trades["subject_date"] = subject_day
@@ -932,8 +1104,14 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
 
                 daily_results.append({
                     "date": subject_day,
-                    "trailing_start": trailing_dates[0],
-                    "trailing_end": trailing_dates[-1],
+                    "lookback_sessions": lookback_sessions,
+                    "window_minutes": best_window_minutes,
+                    "trailing_start": trailing_start,
+                    "trailing_end": trailing_end,
+                    "S1_profit_setting_pct": s1_profit_pct,
+                    "S1_loss_setting_pct": s1_loss_pct,
+                    "S2_profit_setting_pct": s2_profit_pct,
+                    "S2_loss_setting_pct": s2_loss_pct,
                     "S1_return_pct": s1_ret,
                     "S2_return_pct": s2_ret,
                     "S1_trades": len(s1_trades),
@@ -946,29 +1124,41 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
             if results.empty:
                 st.error(
                     "No subject-day results could be calculated. "
-                    "Try a larger stock universe or confirm the selected Alpaca feed has historical coverage."
+                    "Try a smaller lookback, a larger stock universe, or confirm the feed has coverage."
                 )
             else:
                 results["S1_equity_100"] = 100 * (1 + results["S1_return_pct"]/100).cumprod()
                 results["S2_equity_100"] = 100 * (1 + results["S2_return_pct"]/100).cumprod()
 
-                st.success("Rolling 15-day backtest complete.")
+                st.success("Custom backtest complete.")
 
                 mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+
                 mc1.metric(
                     "S1 cumulative",
                     f"{(results['S1_equity_100'].iloc[-1]/100 - 1)*100:.2f}%"
                 )
+
                 mc2.metric(
                     "S2 cumulative",
                     f"{(results['S2_equity_100'].iloc[-1]/100 - 1)*100:.2f}%"
                 )
-                mc3.metric("S1 avg/day", f"{results['S1_return_pct'].mean():.3f}%")
-                mc4.metric("S2 avg/day", f"{results['S2_return_pct'].mean():.3f}%")
+
+                mc3.metric(
+                    "S1 avg/day",
+                    f"{results['S1_return_pct'].mean():.3f}%"
+                )
+
+                mc4.metric(
+                    "S2 avg/day",
+                    f"{results['S2_return_pct'].mean():.3f}%"
+                )
+
                 mc5.metric(
                     "S1 winning days",
                     f"{(results['S1_return_pct'] > 0).mean()*100:.1f}%"
                 )
+
                 mc6.metric(
                     "S2 winning days",
                     f"{(results['S2_return_pct'] > 0).mean()*100:.1f}%"
@@ -978,50 +1168,53 @@ if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_
                 st.dataframe(results, use_container_width=True, hide_index=True)
 
                 st.download_button(
-                    "Download daily backtest results CSV",
+                    "Download daily results CSV",
                     results.to_csv(index=False).encode("utf-8"),
-                    "rolling_15_day_backtest_daily.csv",
+                    "custom_backtest_daily.csv",
                     "text/csv",
-                    key="download_backtest_daily",
+                    key="download_custom_daily",
                 )
 
                 if rankings:
                     rank_df = pd.concat(rankings, ignore_index=True)
                     with st.expander("Top 10 selected for each subject day"):
                         st.dataframe(rank_df, use_container_width=True, hide_index=True)
+
                         st.download_button(
-                            "Download Top-10 rankings CSV",
+                            "Download rankings CSV",
                             rank_df.to_csv(index=False).encode("utf-8"),
-                            "rolling_15_day_rankings.csv",
+                            "custom_backtest_rankings.csv",
                             "text/csv",
-                            key="download_backtest_rankings",
+                            key="download_custom_rankings",
                         )
 
                 if all_s1_trades:
                     s1df = pd.concat(all_s1_trades, ignore_index=True)
                     with st.expander("S1 trade log"):
                         st.dataframe(s1df, use_container_width=True, hide_index=True)
+
                         st.download_button(
                             "Download S1 trade log CSV",
                             s1df.to_csv(index=False).encode("utf-8"),
-                            "S1_trade_log.csv",
+                            "custom_S1_trade_log.csv",
                             "text/csv",
-                            key="download_s1_log",
+                            key="download_custom_s1",
                         )
 
                 if all_s2_trades:
                     s2df = pd.concat(all_s2_trades, ignore_index=True)
                     with st.expander("S2 trade log"):
                         st.dataframe(s2df, use_container_width=True, hide_index=True)
+
                         st.download_button(
                             "Download S2 trade log CSV",
                             s2df.to_csv(index=False).encode("utf-8"),
-                            "S2_trade_log.csv",
+                            "custom_S2_trade_log.csv",
                             "text/csv",
-                            key="download_s2_log",
+                            key="download_custom_s2",
                         )
 
 st.caption(
     "Backtest estimates exclude commissions, bid/ask spread, slippage, taxes and market impact. "
-    "Historical performance does not guarantee future results."
+    "Lookback=0 contains look-ahead bias and is diagnostic only."
 )
