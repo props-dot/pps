@@ -1,39 +1,56 @@
-# One-Hour Stock Strategy — V1
+# One-Hour Stock Strategy — V2
 
-This is a working local dashboard for the strategy specification.
+V2 adds direct Alpaca market-data support to the Streamlit dashboard.
 
-## What it calculates
-- Analysis window: 8:30 AM–10:30 AM America/Chicago
-- Trailing 30 market sessions
-- Top 25 ranked primarily by average gain in the two-hour window
-- 8:30 price / 10:30 price
-- Best contiguous 1-hour interval and gain
-- LDV: largest drop below the 8:30 starting price
-- TDV: sum of all negative step-by-step percentage movements
-- MUT: shortest sustained positive-price run, in seconds
-- Positive-day percentage, median return, and return variability
-- Interactive daily price chart and trailing daily-return chart
+## What V2 does
+- Pulls real 1-minute historical stock bars from Alpaca
+- Uses 8:30–10:30 AM America/Chicago
+- Keeps the latest 30 complete market sessions
+- Ranks Top 25 primarily by average two-hour gain
+- Calculates daily gain, best 1-hour interval, LDV, TDV, MUT, win rate and volatility
+- Adds an optional trade-level Precision Trade Check for a selected stock/day
+- Keeps sample mode available for testing
 
-## Run
-1. Install Python 3.10+
-2. Open a terminal in this folder
-3. Run:
-   pip install -r requirements.txt
-   streamlit run app.py
+## Streamlit setup
 
-## Input data
-The dashboard includes synthetic sample data so it runs immediately.
+After replacing the V1 files in GitHub with these V2 files:
 
-To use real data, upload a CSV with:
-symbol,timestamp,price
+1. Open the deployed Streamlit app.
+2. Click **Manage app**.
+3. Open **Settings**.
+4. Open **Secrets**.
+5. Add:
 
-Timestamp should be UTC or timezone-aware. Second-level or tick-level observations are preferred for TDV and MUT.
+```toml
+ALPACA_API_KEY = "YOUR_ALPACA_KEY"
+ALPACA_SECRET_KEY = "YOUR_ALPACA_SECRET"
+```
 
-## Important data-source note
-Minute bars can support the broader 8:30–10:30 and best-1-hour research, but they cannot faithfully measure a 10-second MUT. For the exact strategy definition, use trade/tick data or second-level aggregates from a licensed market-data provider.
+6. Save and rerun the app.
 
-## Ranking
-V1 displays a consistency score, but the Top 25 ordering intentionally remains primarily based on average 8:30–10:30 gain, matching the stated strategy. Win rate, LDV, TDV, MUT and standard deviation are shown alongside it rather than silently overriding the user's definition.
+Do NOT put API keys directly in GitHub or app.py.
 
-## Next step
-Connect a real historical/live provider, run the full US-stock universe (with liquidity/price filters), and host the Streamlit app.
+## Data feed
+
+The app offers:
+- `iex` — useful for initial/free testing; only one exchange
+- `sip` — consolidated US exchange data; appropriate subscription/access may be needed
+
+For serious ranking, SIP is preferable because it represents the consolidated US market rather than one exchange.
+
+## Precision
+
+The broad universe scan uses 1-minute bars because scanning dozens/hundreds of symbols with every individual trade is expensive and slow.
+
+The selected-symbol **Precision Trade Check** retrieves individual historical trades for one date and calculates:
+- trade-level LDV
+- trade-level total downward volatility
+- minimum upswing time down to the timestamp precision of the feed
+
+## Recommended next stage
+After verifying the Alpaca connection:
+1. Expand the stock universe.
+2. Add price/liquidity filters.
+3. Store each day's results persistently.
+4. Schedule a post-10:30 CT refresh.
+5. Add a morning pre-market candidate view separately from the historical ranking.
