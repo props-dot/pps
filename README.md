@@ -1,56 +1,30 @@
-# One-Hour Stock Strategy — V2
+# One-Hour Stock Strategy V3 — Main-Page Backtest
 
-V2 adds direct Alpaca market-data support to the Streamlit dashboard.
+Replace the current files in your GitHub repo with these files.
 
-## What V2 does
-- Pulls real 1-minute historical stock bars from Alpaca
-- Uses 8:30–10:30 AM America/Chicago
-- Keeps the latest 30 complete market sessions
-- Ranks Top 25 primarily by average two-hour gain
-- Calculates daily gain, best 1-hour interval, LDV, TDV, MUT, win rate and volatility
-- Adds an optional trade-level Precision Trade Check for a selected stock/day
-- Keeps sample mode available for testing
+Most importantly, replace the existing `app.py` with this V3 `app.py`.
 
-## Streamlit setup
+The existing live dashboard remains on the main page. A new section named
+**Rolling 15-Day Strategy Backtest** is added below the existing dashboard.
 
-After replacing the V1 files in GitHub with these V2 files:
+Default test dates:
+- First subject day: August 11, 2026
+- Last subject day: August 25, 2026
 
-1. Open the deployed Streamlit app.
-2. Click **Manage app**.
-3. Open **Settings**.
-4. Open **Secrets**.
-5. Add:
+Click **Run rolling 15-day backtest** on the main dashboard.
 
-```toml
-ALPACA_API_KEY = "YOUR_ALPACA_KEY"
-ALPACA_SECRET_KEY = "YOUR_ALPACA_SECRET"
-```
+This version reuses:
+- the stock universe selected in the existing sidebar
+- the Alpaca feed selected in the existing sidebar
+- the existing Streamlit Alpaca secrets
 
-6. Save and rerun the app.
+No `pages` directory is needed.
 
-Do NOT put API keys directly in GitHub or app.py.
-
-## Data feed
-
-The app offers:
-- `iex` — useful for initial/free testing; only one exchange
-- `sip` — consolidated US exchange data; appropriate subscription/access may be needed
-
-For serious ranking, SIP is preferable because it represents the consolidated US market rather than one exchange.
-
-## Precision
-
-The broad universe scan uses 1-minute bars because scanning dozens/hundreds of symbols with every individual trade is expensive and slow.
-
-The selected-symbol **Precision Trade Check** retrieves individual historical trades for one date and calculates:
-- trade-level LDV
-- trade-level total downward volatility
-- minimum upswing time down to the timestamp precision of the feed
-
-## Recommended next stage
-After verifying the Alpaca connection:
-1. Expand the stock universe.
-2. Add price/liquidity filters.
-3. Store each day's results persistently.
-4. Schedule a post-10:30 CT refresh.
-5. Add a morning pre-market candidate view separately from the historical ranking.
+Backtest assumptions:
+- Each subject day uses only the immediately preceding 15 completed market sessions.
+- Top 10 are ranked by average 8:30–10:30 AM Central return.
+- Historical best hour is selected from 1-minute start times from 8:30–9:30 Central.
+- S1 uses equal capital across Top 10.
+- S2 uses a sequential 100%-capital round robin and compounds.
+- If target and stop both occur inside the same 1-minute bar, stop is assumed first.
+- No transaction costs, spread, slippage, taxes, or market impact are included.

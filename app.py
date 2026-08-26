@@ -333,6 +333,324 @@ def precision_metrics_from_trades(df):
     return {"ldv_pct":ldv, "tdv_pct":tdv, "mut_seconds":mut, "trade_count":len(df)}
 
 # Sidebar
+
+# Backtest aliases
+START_CT = START_TIME
+END_CT = END_TIME
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def fetch_session(symbols_tuple, session_date, feed="iex"):
+    """Fetch only 8:30–10:30 Central for one date, 1-minute bars."""
+    syms = list(symbols_tuple)
+    d = pd.Timestamp(session_date).date()
+    start_local = datetime.combine(d, START_CT, tzinfo=CT)
+    # Alpaca bar end is inclusive enough for our close/end handling.
+    end_local = datetime.combine(d, END_CT, tzinfo=CT)
+
+    params = {
+        "symbols": ",".join(syms),
+        "timeframe": "1Min",
+        "start": start_local.astimezone(UTC).isoformat(),
+        "end": end_local.astimezone(UTC).isoformat(),
+        "limit": 10000,
+        "adjustment": "split",
+        "feed": feed,
+        "sort": "asc",
+    }
+
+    rows = []
+    token = None
+    while True:
+        if token:
+            params["page_token"] = token
+        elif "page_token" in params:
+            del params["page_token"]
+
+        r = requests.get(
+            "https://data.alpaca.markets/v2/stocks/bars",
+            headers=alpaca_headers(),
+            params=params,
+            timeout=60,
+        )
+        if r.status_code == 429:
+            time_module.sleep(2.0)
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"Alpaca {r.status_code}: {r.text[:500]}")
+
+        payload = r.json()
+        for sym, recs in payload.get("bars", {}).items():
+            for x in recs:
+                rows.append({
+                    "symbol": sym,
+                    "timestamp": x["t"],
+                    "open": float(x["o"]),
+                    "high": float(x["h"]),
+                    "low": float(x["l"]),
+                    "close": float(x["c"]),
+                    "volume": float(x.get("v", 0)),
+                })
+        token = payload.get("next_page_token")
+        if not token:
+            break
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(CT)
+    df["date"] = df["timestamp"].dt.date
+    df["minute"] = (
+        (df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute)
+        - (8*60 + 30)
+    )
+    return df.sort_values(["symbol", "timestamp"])
+
+def session_complete(g):
+    if g.empty:
+        return False
+    mins = set(g["minute"].astype(int).tolist())
+    return 0 in mins and 120 in mins and len(mins) >= 115
+
+def session_metrics(g):
+    g = g.sort_values("minute")
+    start = float(g.iloc[0]["open"])
+    end = float(g.iloc[-1]["close"])
+    gain = (end/start - 1) * 100
+    ldv = max(0.0, (start - float(g["low"].min())) / start * 100)
+    return gain, ldv
+
+def price_at_or_after(g, minute):
+    z = g[g["minute"] >= minute].sort_values("minute")
+    if z.empty:
+        return None
+    return z.iloc[0]
+
+def bar_at(g, minute):
+    z = g[g["minute"] == minute]
+    if z.empty:
+        return None
+    return z.iloc[0]
+
+def build_history(all_df, trailing_dates, symbols):
+    rows = []
+    for sym in symbols:
+        sym_daily = []
+        complete = True
+        for d in trailing_dates:
+            g = all_df[(all_df["symbol"] == sym) & (all_df["date"] == d)]
+            if not session_complete(g):
+                complete = False
+                break
+            gain, ldv = session_metrics(g)
+            sym_daily.append((d, gain, ldv, g))
+        if not complete or len(sym_daily) != 15:
+            continue
+
+        avg_gain = float(np.mean([x[1] for x in sym_daily]))
+        avg_ldv = float(np.mean([x[2] for x in sym_daily]))
+
+        # Exact rolling historical "best average 1-hour" on a 1-minute start grid.
+        best_start = None
+        best_avg_1h = -np.inf
+        for start_min in range(0, 61):  # 8:30 through 9:30 CT
+            end_min = start_min + 60
+            returns = []
+            valid = True
+            for _, _, _, g in sym_daily:
+                b0 = bar_at(g, start_min)
+                b1 = bar_at(g, end_min)
+                if b0 is None or b1 is None:
+                    valid = False
+                    break
+                ret = (float(b1["close"]) / float(b0["open"]) - 1) * 100
+                returns.append(ret)
+            if valid and len(returns) == 15:
+                av = float(np.mean(returns))
+                if av > best_avg_1h:
+                    best_avg_1h = av
+                    best_start = start_min
+
+        if best_start is None:
+            continue
+
+        rows.append({
+            "symbol": sym,
+            "avg_2h_gain_pct": avg_gain,
+            "avg_ldv_pct": avg_ldv,
+            "best_start_min": int(best_start),
+            "best_end_min": int(best_start + 60),
+            "best_avg_1h_gain_pct": float(best_avg_1h),
+        })
+
+    rank = pd.DataFrame(rows)
+    if rank.empty:
+        return rank
+
+    # Top performers = highest average 8:30–10:30 return, matching project definition.
+    rank = rank.sort_values(
+        ["avg_2h_gain_pct", "best_avg_1h_gain_pct", "avg_ldv_pct"],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
+    rank["rank"] = np.arange(1, len(rank)+1)
+    return rank
+
+def time_label(minute):
+    base = datetime(2000,1,1,8,30)
+    return (base + timedelta(minutes=int(minute))).strftime("%-I:%M %p")
+
+def simulate_one_trade(g, entry_min, end_min, gain_target_pct, stop_pct):
+    """
+    One-minute-bar estimate.
+    Entry at bar open.
+    If both target and stop appear inside same minute, stop is assumed first (conservative).
+    Returns exit minute, return %, exit reason.
+    """
+    entry_bar = price_at_or_after(g, entry_min)
+    if entry_bar is None or int(entry_bar["minute"]) > end_min:
+        return None
+
+    actual_entry_min = int(entry_bar["minute"])
+    entry = float(entry_bar["open"])
+    target = entry * (1 + max(0.0, gain_target_pct) / 100)
+    stop = entry * (1 - max(0.0, stop_pct) / 100)
+
+    scan = g[(g["minute"] >= actual_entry_min) & (g["minute"] <= end_min)].sort_values("minute")
+    if scan.empty:
+        return None
+
+    for _, b in scan.iterrows():
+        lo = float(b["low"])
+        hi = float(b["high"])
+        m = int(b["minute"])
+
+        stop_hit = lo <= stop if stop_pct > 0 else False
+        target_hit = hi >= target if gain_target_pct > 0 else False
+
+        if stop_hit and target_hit:
+            exit_px = stop
+            return {
+                "entry_min": actual_entry_min, "exit_min": m,
+                "entry_price": entry, "exit_price": exit_px,
+                "return_pct": (exit_px/entry - 1)*100,
+                "reason": "STOP (both hit same bar)"
+            }
+        if stop_hit:
+            exit_px = stop
+            return {
+                "entry_min": actual_entry_min, "exit_min": m,
+                "entry_price": entry, "exit_price": exit_px,
+                "return_pct": (exit_px/entry - 1)*100,
+                "reason": "STOP"
+            }
+        if target_hit:
+            exit_px = target
+            return {
+                "entry_min": actual_entry_min, "exit_min": m,
+                "entry_price": entry, "exit_price": exit_px,
+                "return_pct": (exit_px/entry - 1)*100,
+                "reason": "TARGET"
+            }
+
+    last = scan.iloc[-1]
+    exit_px = float(last["close"])
+    return {
+        "entry_min": actual_entry_min, "exit_min": int(last["minute"]),
+        "entry_price": entry, "exit_price": exit_px,
+        "return_pct": (exit_px/entry - 1)*100,
+        "reason": "BEST-HOUR END"
+    }
+
+def run_s1(subject_df, top10):
+    trades = []
+    for _, r in top10.iterrows():
+        g = subject_df[subject_df["symbol"] == r["symbol"]]
+        tr = simulate_one_trade(
+            g,
+            int(r["best_start_min"]),
+            int(r["best_end_min"]),
+            0.50 * float(r["best_avg_1h_gain_pct"]),
+            0.50 * float(r["avg_ldv_pct"]),
+        )
+        if tr:
+            trades.append({
+                "symbol": r["symbol"],
+                "rank": int(r["rank"]),
+                **tr,
+            })
+
+    if not trades:
+        return np.nan, pd.DataFrame()
+
+    tdf = pd.DataFrame(trades)
+    # Equal capital in all Top 10.
+    return float(tdf["return_pct"].mean()), tdf
+
+def run_s2(subject_df, top10):
+    """
+    100% capital round-robin.
+    #1 begins no earlier than its historical best start.
+    After each exit, the next eligible name begins at the NEXT minute to avoid
+    impossible within-minute sequencing. A name is skipped if its best hour ended.
+    After #10, cycle back to #1 while any best-hour window remains open.
+    Daily return compounds each sequential trade.
+    """
+    rows = top10.sort_values("rank").to_dict("records")
+    if not rows:
+        return np.nan, pd.DataFrame()
+
+    current_min = int(rows[0]["best_start_min"])
+    idx = 0
+    equity = 1.0
+    trades = []
+    no_trade_pass = 0
+
+    # Hard guard against pathological loops.
+    for _ in range(200):
+        r = rows[idx]
+        start = int(r["best_start_min"])
+        end = int(r["best_end_min"])
+
+        entry_min = max(current_min, start)
+        did_trade = False
+
+        if entry_min <= end:
+            g = subject_df[subject_df["symbol"] == r["symbol"]]
+            tr = simulate_one_trade(
+                g,
+                entry_min,
+                end,
+                0.75 * float(r["best_avg_1h_gain_pct"]),
+                0.30 * float(r["avg_ldv_pct"]),
+            )
+            if tr:
+                did_trade = True
+                equity *= (1 + tr["return_pct"]/100)
+                trades.append({
+                    "cycle_position": idx + 1,
+                    "symbol": r["symbol"],
+                    "rank": int(r["rank"]),
+                    **tr,
+                    "equity_after": equity,
+                })
+                current_min = int(tr["exit_min"]) + 1
+
+        idx = (idx + 1) % len(rows)
+
+        if did_trade:
+            no_trade_pass = 0
+        else:
+            no_trade_pass += 1
+
+        # If we've checked all 10 without finding any eligible remaining window, stop.
+        if no_trade_pass >= len(rows):
+            break
+        # No strategy trading past 10:30 CT.
+        if current_min > 120:
+            break
+
+    return (equity - 1) * 100, pd.DataFrame(trades)
+
+
 st.sidebar.header("Market Data")
 mode = st.sidebar.radio("Source", ["Real Alpaca data", "Built-in sample data"])
 feed = st.sidebar.selectbox("Alpaca feed", ["iex","sip"], index=0,
@@ -461,4 +779,225 @@ st.download_button(
 st.caption(
     "Research/backtesting tool only; not investment advice. Historical intraday patterns may not persist. "
     "Spreads, slippage, liquidity, halts, fees, data-feed coverage and survivorship bias can materially change results."
+)
+
+
+st.divider()
+st.header("Rolling 15-Day Strategy Backtest")
+st.caption(
+    "For each subject day, the model selects that day's Top 10 using only the previous "
+    "15 completed market sessions, then simulates S1 and S2 on the actual subject-day prices."
+)
+
+with st.expander("Backtest definitions & assumptions", expanded=False):
+    st.markdown(
+        """
+**S1 — Trigger Scenario**
+- Equal capital across all Top 10.
+- Enter each stock at its trailing-15 historical best-hour start.
+- Profit exit: **50% of best average 1-hour gain**.
+- Stop exit: **50% of trailing-15 average LDV**.
+- If neither triggers, exit at that stock's historical best-hour end.
+
+**S2 — Round Robin**
+- Start with rank #1 and use one pool of capital sequentially.
+- Profit exit: **75% of best average 1-hour gain**.
+- Stop exit: **30% of trailing-15 average LDV**.
+- After an exit, move to the next ranked stock if its historical best hour is still open.
+- After #10, cycle back to #1 while eligible best-hour windows remain.
+- The next trade begins on the next 1-minute bar after the prior exit.
+- Returns compound sequentially.
+
+**Estimation rule**
+If both the target and stop are touched inside the same 1-minute candle, the backtest
+assumes the **stop occurred first**. This is deliberately conservative because 1-minute
+bars do not reveal the exact intrabar order.
+"""
+    )
+
+bc1, bc2 = st.columns(2)
+with bc1:
+    backtest_start = st.date_input(
+        "First subject day",
+        value=pd.Timestamp("2026-08-11").date(),
+        key="backtest_subject_start",
+    )
+with bc2:
+    backtest_end = st.date_input(
+        "Last subject day",
+        value=pd.Timestamp("2026-08-25").date(),
+        key="backtest_subject_end",
+    )
+
+st.caption(
+    f"The backtest will use the current sidebar universe ({len(symbols)} symbols) "
+    f"and the current **{feed.upper()}** market-data feed."
+)
+
+if st.button("Run rolling 15-day backtest", type="primary", key="run_rolling_15_backtest"):
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        st.error("Alpaca credentials are missing from Streamlit Secrets.")
+    elif backtest_end < backtest_start:
+        st.error("The last subject day must be on or after the first subject day.")
+    else:
+        # Pull enough calendar history to obtain at least 15 completed trading sessions.
+        calendar_start = pd.Timestamp(backtest_start) - pd.Timedelta(days=35)
+        calendar_end = pd.Timestamp(backtest_end)
+        candidate_dates = [d.date() for d in pd.bdate_range(calendar_start, calendar_end)]
+
+        progress = st.progress(0)
+        status = st.empty()
+        frames = []
+
+        for i, d in enumerate(candidate_dates):
+            status.write(f"Loading market data for {d} ({i+1}/{len(candidate_dates)})...")
+            try:
+                x = fetch_session(tuple(symbols), str(d), feed)
+            except Exception as e:
+                st.error(f"{d}: {e}")
+                st.stop()
+            if not x.empty:
+                frames.append(x)
+            progress.progress((i + 1) / len(candidate_dates))
+
+        status.empty()
+
+        if not frames:
+            st.error("No Alpaca market data was returned for the requested period.")
+        else:
+            all_bt_df = pd.concat(frames, ignore_index=True)
+            available_dates = sorted(all_bt_df["date"].unique())
+            subject_dates = [
+                d for d in available_dates
+                if backtest_start <= d <= backtest_end
+            ]
+
+            daily_results = []
+            all_s1_trades = []
+            all_s2_trades = []
+            rankings = []
+
+            for subject_day in subject_dates:
+                previous_dates = [x for x in available_dates if x < subject_day]
+                if len(previous_dates) < 15:
+                    continue
+
+                trailing_dates = previous_dates[-15:]
+                hist = build_history(all_bt_df, trailing_dates, symbols)
+                if hist.empty or len(hist) < 10:
+                    continue
+
+                top10 = hist.head(10).copy()
+                top10["subject_date"] = subject_day
+                top10["best_start_ct"] = top10["best_start_min"].map(time_label)
+                top10["best_end_ct"] = top10["best_end_min"].map(time_label)
+                rankings.append(top10)
+
+                subject_df = all_bt_df[all_bt_df["date"] == subject_day]
+
+                s1_ret, s1_trades = run_s1(subject_df, top10)
+                s2_ret, s2_trades = run_s2(subject_df, top10)
+
+                if not s1_trades.empty:
+                    s1_trades["subject_date"] = subject_day
+                    all_s1_trades.append(s1_trades)
+
+                if not s2_trades.empty:
+                    s2_trades["subject_date"] = subject_day
+                    all_s2_trades.append(s2_trades)
+
+                daily_results.append({
+                    "date": subject_day,
+                    "trailing_start": trailing_dates[0],
+                    "trailing_end": trailing_dates[-1],
+                    "S1_return_pct": s1_ret,
+                    "S2_return_pct": s2_ret,
+                    "S1_trades": len(s1_trades),
+                    "S2_trades": len(s2_trades),
+                    "top10": ", ".join(top10["symbol"].tolist()),
+                })
+
+            results = pd.DataFrame(daily_results)
+
+            if results.empty:
+                st.error(
+                    "No subject-day results could be calculated. "
+                    "Try a larger stock universe or confirm the selected Alpaca feed has historical coverage."
+                )
+            else:
+                results["S1_equity_100"] = 100 * (1 + results["S1_return_pct"]/100).cumprod()
+                results["S2_equity_100"] = 100 * (1 + results["S2_return_pct"]/100).cumprod()
+
+                st.success("Rolling 15-day backtest complete.")
+
+                mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+                mc1.metric(
+                    "S1 cumulative",
+                    f"{(results['S1_equity_100'].iloc[-1]/100 - 1)*100:.2f}%"
+                )
+                mc2.metric(
+                    "S2 cumulative",
+                    f"{(results['S2_equity_100'].iloc[-1]/100 - 1)*100:.2f}%"
+                )
+                mc3.metric("S1 avg/day", f"{results['S1_return_pct'].mean():.3f}%")
+                mc4.metric("S2 avg/day", f"{results['S2_return_pct'].mean():.3f}%")
+                mc5.metric(
+                    "S1 winning days",
+                    f"{(results['S1_return_pct'] > 0).mean()*100:.1f}%"
+                )
+                mc6.metric(
+                    "S2 winning days",
+                    f"{(results['S2_return_pct'] > 0).mean()*100:.1f}%"
+                )
+
+                st.subheader("Estimated daily returns")
+                st.dataframe(results, use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    "Download daily backtest results CSV",
+                    results.to_csv(index=False).encode("utf-8"),
+                    "rolling_15_day_backtest_daily.csv",
+                    "text/csv",
+                    key="download_backtest_daily",
+                )
+
+                if rankings:
+                    rank_df = pd.concat(rankings, ignore_index=True)
+                    with st.expander("Top 10 selected for each subject day"):
+                        st.dataframe(rank_df, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download Top-10 rankings CSV",
+                            rank_df.to_csv(index=False).encode("utf-8"),
+                            "rolling_15_day_rankings.csv",
+                            "text/csv",
+                            key="download_backtest_rankings",
+                        )
+
+                if all_s1_trades:
+                    s1df = pd.concat(all_s1_trades, ignore_index=True)
+                    with st.expander("S1 trade log"):
+                        st.dataframe(s1df, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download S1 trade log CSV",
+                            s1df.to_csv(index=False).encode("utf-8"),
+                            "S1_trade_log.csv",
+                            "text/csv",
+                            key="download_s1_log",
+                        )
+
+                if all_s2_trades:
+                    s2df = pd.concat(all_s2_trades, ignore_index=True)
+                    with st.expander("S2 trade log"):
+                        st.dataframe(s2df, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download S2 trade log CSV",
+                            s2df.to_csv(index=False).encode("utf-8"),
+                            "S2_trade_log.csv",
+                            "text/csv",
+                            key="download_s2_log",
+                        )
+
+st.caption(
+    "Backtest estimates exclude commissions, bid/ask spread, slippage, taxes and market impact. "
+    "Historical performance does not guarantee future results."
 )
