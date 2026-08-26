@@ -447,9 +447,10 @@ def build_history(all_df, trailing_dates, symbols):
             continue
 
         avg_gain = float(np.mean([x[1] for x in sym_daily]))
-        avg_ldv = float(np.mean([x[2] for x in sym_daily]))
+        median_ldv = float(np.median([x[2] for x in sym_daily]))
 
-        # Exact rolling historical "best average 1-hour" on a 1-minute start grid.
+        # Determine the historically best average 1-hour START TIME
+        # on a 1-minute grid, using only the prior 15 sessions.
         best_start = None
         best_avg_1h = -np.inf
         for start_min in range(0, 61):  # 8:30 through 9:30 CT
@@ -473,13 +474,36 @@ def build_history(all_df, trailing_dates, symbols):
         if best_start is None:
             continue
 
+        # For the profit target, calculate EACH prior day's best 1-hour gain,
+        # then take the median of those 15 daily best-hour gains.
+        daily_best_1h_gains = []
+        for _, _, _, g in sym_daily:
+            day_best = -np.inf
+            for start_min in range(0, 61):
+                end_min = start_min + 60
+                b0 = bar_at(g, start_min)
+                b1 = bar_at(g, end_min)
+                if b0 is None or b1 is None:
+                    continue
+                ret = (float(b1["close"]) / float(b0["open"]) - 1) * 100
+                if ret > day_best:
+                    day_best = ret
+            if np.isfinite(day_best):
+                daily_best_1h_gains.append(float(day_best))
+
+        if len(daily_best_1h_gains) != 15:
+            continue
+
+        median_best_1h_gain = float(np.median(daily_best_1h_gains))
+
         rows.append({
             "symbol": sym,
             "avg_2h_gain_pct": avg_gain,
-            "avg_ldv_pct": avg_ldv,
+            "median_ldv_pct": median_ldv,
             "best_start_min": int(best_start),
             "best_end_min": int(best_start + 60),
             "best_avg_1h_gain_pct": float(best_avg_1h),
+            "median_daily_best_1h_gain_pct": median_best_1h_gain,
         })
 
     rank = pd.DataFrame(rows)
@@ -488,7 +512,7 @@ def build_history(all_df, trailing_dates, symbols):
 
     # Top performers = highest average 8:30–10:30 return, matching project definition.
     rank = rank.sort_values(
-        ["avg_2h_gain_pct", "best_avg_1h_gain_pct", "avg_ldv_pct"],
+        ["avg_2h_gain_pct", "best_avg_1h_gain_pct", "median_ldv_pct"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
     rank["rank"] = np.arange(1, len(rank)+1)
@@ -568,8 +592,8 @@ def run_s1(subject_df, top10):
             g,
             int(r["best_start_min"]),
             int(r["best_end_min"]),
-            0.50 * float(r["best_avg_1h_gain_pct"]),
-            0.50 * float(r["avg_ldv_pct"]),
+            0.90 * float(r["median_daily_best_1h_gain_pct"]),
+            0.80 * float(r["median_ldv_pct"]),
         )
         if tr:
             trades.append({
@@ -619,8 +643,8 @@ def run_s2(subject_df, top10):
                 g,
                 entry_min,
                 end,
-                0.75 * float(r["best_avg_1h_gain_pct"]),
-                0.30 * float(r["avg_ldv_pct"]),
+                0.90 * float(r["median_daily_best_1h_gain_pct"]),
+                0.80 * float(r["median_ldv_pct"]),
             )
             if tr:
                 did_trade = True
@@ -795,14 +819,14 @@ with st.expander("Backtest definitions & assumptions", expanded=False):
 **S1 — Trigger Scenario**
 - Equal capital across all Top 10.
 - Enter each stock at its trailing-15 historical best-hour start.
-- Profit exit: **50% of best average 1-hour gain**.
-- Stop exit: **50% of trailing-15 average LDV**.
+- Profit exit: **90% of trailing-15 median daily best 1-hour gain**.
+- Stop exit: **80% of trailing-15 median LDV**.
 - If neither triggers, exit at that stock's historical best-hour end.
 
 **S2 — Round Robin**
 - Start with rank #1 and use one pool of capital sequentially.
-- Profit exit: **75% of best average 1-hour gain**.
-- Stop exit: **30% of trailing-15 average LDV**.
+- Profit exit: **90% of trailing-15 median daily best 1-hour gain**.
+- Stop exit: **80% of trailing-15 median LDV**.
 - After an exit, move to the next ranked stock if its historical best hour is still open.
 - After #10, cycle back to #1 while eligible best-hour windows remain.
 - The next trade begins on the next 1-minute bar after the prior exit.
